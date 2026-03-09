@@ -1,7 +1,8 @@
+import gc
 import logging
 
 import numpy as np
-import torch 
+import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
@@ -65,6 +66,11 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     nt = ops['nt']
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
+
+    # Free memory from prior pipeline stages before heavy allocations
+    gc.collect()
+    torch.cuda.empty_cache()
+
     ctc, WtW = prepare_matching(ops, U)
     st = np.zeros((10**6, 3), 'float64')
     tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
@@ -218,7 +224,9 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
     for t in range(max_peels):
         # Cf = 2 * B - nm.unsqueeze(-1)
         # Cf is shape (n_units, n_times)
-        Cf = torch.relu(B)**2 /nm.unsqueeze(-1)
+        # Use clamp + in-place ops to avoid allocating multiple full-size temps
+        Cf = torch.clamp(B, min=0)
+        Cf.pow_(2).div_(nm.unsqueeze(-1))
         #a = 1 + lam
         #b = torch.relu(B) + lam * mu.unsqueeze(-1)
         #Cf = b**2 / a - lam * mu.unsqueeze(-1)**2
@@ -227,6 +235,7 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
         Cf[:, -nt:] = 0
 
         Cfmax, imax = torch.max(Cf, 0)
+        del Cf
         Cmax  = max_pool1d(Cfmax.unsqueeze(0).unsqueeze(0), (2*nt+1), stride=1, padding=(nt))
 
         #print(Cfmax.shape)
