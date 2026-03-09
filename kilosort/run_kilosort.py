@@ -255,37 +255,60 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             )
 
         tic0 = time.time()
-        ops, settings = initialize_ops(
-            settings, probe, data_dtype, do_CAR, invert_sign,
-            device, save_preprocessed_copy, gui_mode=(gui_sorter is not None)
-            )
-        
-        # Pretty-print ops and probe for log
-        logger.debug(f"Initial ops:\n\n{ops_as_string(ops)}\n")
-        logger.debug(f"Probe dictionary:\n\n{probe_as_string(ops['probe'])}\n")
 
-        # Baseline performance metrics
-        log_performance(logger, 'info', 'Resource usage before sorting')
-        log_thread_count(logger)
+        # Check for existing preprocessed data from a previous (possibly failed) run
+        temp_wh_path = results_dir / 'temp_wh.dat'
+        ops_path = results_dir / 'ops.npy'
+        if temp_wh_path.exists() and ops_path.exists():
+            logger.info(f'Found existing temp_wh.dat and ops.npy in {results_dir}')
+            logger.info('Reusing preprocessed data from previous run.')
+            ops = io.load_ops(ops_path, device=device)
 
-        # Set preprocessing and drift correction parameters
-        ops = compute_preprocessing(ops, device, tic0=tic0, file_object=file_object)
-        np.random.seed(1)
-        torch.cuda.manual_seed_all(1)
-        torch.random.manual_seed(1) 
-        ops, bfile, st0 = compute_drift_correction(
-            ops, device, tic0=tic0, progress_bar=progress_bar,
-            file_object=file_object, clear_cache=clear_cache,
-            verbose=verbose_log
-            )
+            n_chan_bin = ops['n_chan_bin']
+            chan_map = ops['chanMap'] if isinstance(ops['chanMap'], np.ndarray) \
+                else ops['probe']['chanMap']
+            bfile = io.BinaryFiltered(
+                temp_wh_path, n_chan_bin, fs=ops['fs'], NT=ops['batch_size'],
+                nt=ops['nt'], nt0min=ops['nt0min'], chan_map=chan_map,
+                hp_filter=None, whiten_mat=None, dshift=None, device=device,
+                do_CAR=False, invert_sign=False, dtype='int16',
+                tmin=0.0, tmax=np.inf, scale=1.0/200,
+                )
+            st0 = None
+        else:
+            ops, settings = initialize_ops(
+                settings, probe, data_dtype, do_CAR, invert_sign,
+                device, save_preprocessed_copy, gui_mode=(gui_sorter is not None)
+                )
 
-        log_thread_count(logger)
+            # Pretty-print ops and probe for log
+            logger.debug(f"Initial ops:\n\n{ops_as_string(ops)}\n")
+            logger.debug(f"Probe dictionary:\n\n{probe_as_string(ops['probe'])}\n")
 
-        # Save preprocessing steps
-        if save_preprocessed_copy:
-            io.save_preprocessing(results_dir / 'temp_wh.dat', ops, bfile)
-            log_performance(logger, 'info', 'Resource usage after saving preprocessing.',
-                            reset=True)
+            # Baseline performance metrics
+            log_performance(logger, 'info', 'Resource usage before sorting')
+            log_thread_count(logger)
+
+            # Set preprocessing and drift correction parameters
+            ops = compute_preprocessing(ops, device, tic0=tic0, file_object=file_object)
+            np.random.seed(1)
+            torch.cuda.manual_seed_all(1)
+            torch.random.manual_seed(1)
+            ops, bfile, st0 = compute_drift_correction(
+                ops, device, tic0=tic0, progress_bar=progress_bar,
+                file_object=file_object, clear_cache=clear_cache,
+                verbose=verbose_log
+                )
+
+            log_thread_count(logger)
+
+            # Save preprocessing steps
+            if save_preprocessed_copy:
+                io.save_preprocessing(results_dir / 'temp_wh.dat', ops, bfile)
+                io.save_ops(ops, results_dir)
+                log_performance(logger, 'info',
+                                'Resource usage after saving preprocessing.',
+                                reset=True)
 
         logger.info('Generating drift plots ...')
         # st0 will be None if nblocks = 0 (no drift correction)
