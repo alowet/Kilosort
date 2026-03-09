@@ -64,8 +64,8 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     ops['iU'] = iU
     nt = ops['nt']
     
-    tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
-    ctc = prepare_matching(ops, U)
+    tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
+    ctc, WtW = prepare_matching(ops, U)
     st = np.zeros((10**6, 3), 'float64')
     tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
     k = 0
@@ -81,7 +81,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = bfile.padded_batch_to_torch(ibatch, ops)
-            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
+            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, WtW, device=device)
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
 
@@ -155,33 +155,57 @@ def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
 def prepare_matching(ops, U):
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
-    WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
+    WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt)
     WtW = torch.flip(WtW, [2,])
 
-    #mu = (U**2).sum(-1).sum(-1)**.5
-    #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
+    N = U.shape[0]
+    ctc_bytes = N * N * (2*nt+1) * 4
+    try:
+        free_mem = torch.cuda.mem_get_info(U.device)[0]
+    except Exception:
+        free_mem = 0
 
-    UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
-    ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+    # Use precomputed ctc if it fits comfortably in GPU memory
+    if ctc_bytes < free_mem * 0.4:
+        UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
+        ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+        return ctc, None
+    else:
+        logger.info(
+            f'Too many templates ({N}) for precomputed ctc '
+            f'({ctc_bytes/1e9:.1f} GB), using chunked on-the-fly computation'
+        )
+        return None, WtW
 
-    return ctc
+
+def _compute_ctc_columns(U, WtW, sel_iY, chunk_size=128):
+    """Compute ctc[:, sel_iY, :] on-the-fly in chunks to avoid O(N^2) memory."""
+    ctc_chunks = []
+    for c_start in range(0, len(sel_iY), chunk_size):
+        c_end = min(c_start + chunk_size, len(sel_iY))
+        U_chunk = U[sel_iY[c_start:c_end]]
+        UtU_chunk = torch.einsum('ikl, jml -> ijkm', U, U_chunk)
+        ctc_chunk = torch.einsum('ijkm, kml -> ijl', UtU_chunk, WtW)
+        ctc_chunks.append(ctc_chunk)
+        del UtU_chunk
+    return torch.cat(ctc_chunks, dim=1) if len(ctc_chunks) > 1 else ctc_chunks[0]
 
 
-def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
     W = ops['wPCA'].contiguous()
 
     nm = (U**2).sum(-1).sum(-1)
-    #mu = nm**.5 
+    #mu = nm**.5
     #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
 
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
     B = torch.einsum('ijk, kjl -> il', U, B)
 
-    trange = torch.arange(-nt, nt+1, device=device) 
-    tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
+    trange = torch.arange(-nt, nt+1, device=device)
+    tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
     st = torch.zeros((100000,2), dtype = torch.int64, device = device)
     amps = torch.zeros((100000,1), dtype = torch.float, device = device)
@@ -192,7 +216,7 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     lam = 20
 
     for t in range(max_peels):
-        # Cf = 2 * B - nm.unsqueeze(-1) 
+        # Cf = 2 * B - nm.unsqueeze(-1)
         # Cf is shape (n_units, n_times)
         Cf = torch.relu(B)**2 /nm.unsqueeze(-1)
         #a = 1 + lam
@@ -211,7 +235,7 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
         cnd2 = torch.abs(Cmax[0,0] - Cfmax) < 1e-9
         xs = torch.nonzero(cnd1 * cnd2)
 
-        
+
         if len(xs)==0:
             #print('iter %d'%t)
             break
@@ -230,12 +254,17 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
         k+= nsp
 
-        #amp = B[iY,iX] 
+        #amp = B[iY,iX]
 
         n = 2
         for j in range(n):
             Xres[:, iX[j::n] + tiwave]  -= amp[j::n] * torch.einsum('ijk, jl -> kil', U[iY[j::n,0]], W)
-            B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
+            if ctc is not None:
+                B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
+            else:
+                ctc_sel = _compute_ctc_columns(U, WtW, iY[j::n, 0])
+                B[:, iX[j::n] + trange]  -= amp[j::n] * ctc_sel
+                del ctc_sel
 
     st = st[:k]
     amps = amps[:k]
