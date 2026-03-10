@@ -207,6 +207,9 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
     #mu = nm**.5
     #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
 
+    # Reclaim reserved-but-unallocated memory before large B allocation
+    torch.cuda.empty_cache()
+
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
     B = torch.einsum('ijk, kjl -> il', U, B)
 
@@ -222,20 +225,28 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
     lam = 20
 
     for t in range(max_peels):
-        # Cf = 2 * B - nm.unsqueeze(-1)
-        # Cf is shape (n_units, n_times)
-        # Use clamp + in-place ops to avoid allocating multiple full-size temps
-        Cf = torch.clamp(B, min=0)
-        Cf.pow_(2).div_(nm.unsqueeze(-1))
+        # Cf = clamp(B,0)^2 / nm, shape (n_units, n_times)
+        # Compute Cfmax and imax in chunks to avoid allocating full Cf tensor
         #a = 1 + lam
         #b = torch.relu(B) + lam * mu.unsqueeze(-1)
         #Cf = b**2 / a - lam * mu.unsqueeze(-1)**2
 
-        Cf[:, :nt] = 0
-        Cf[:, -nt:] = 0
-
-        Cfmax, imax = torch.max(Cf, 0)
-        del Cf
+        N_templates = B.shape[0]
+        NT = B.shape[1]
+        cf_chunk_size = max(1, min(N_templates, int(0.15 * torch.cuda.mem_get_info(device)[0] / (NT * 4))))
+        Cfmax = torch.full((NT,), -1.0, device=device)
+        imax = torch.zeros(NT, dtype=torch.long, device=device)
+        for ci in range(0, N_templates, cf_chunk_size):
+            ce = min(ci + cf_chunk_size, N_templates)
+            Cf_chunk = torch.clamp(B[ci:ce], min=0)
+            Cf_chunk.pow_(2).div_(nm[ci:ce].unsqueeze(-1))
+            Cf_chunk[:, :nt] = 0
+            Cf_chunk[:, -nt:] = 0
+            chunk_max, chunk_imax = torch.max(Cf_chunk, 0)
+            better = chunk_max > Cfmax
+            imax[better] = chunk_imax[better] + ci
+            Cfmax[better] = chunk_max[better]
+            del Cf_chunk, chunk_max, chunk_imax
         Cmax  = max_pool1d(Cfmax.unsqueeze(0).unsqueeze(0), (2*nt+1), stride=1, padding=(nt))
 
         #print(Cfmax.shape)
