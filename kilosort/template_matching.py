@@ -270,7 +270,7 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
             Xres[:, iX[j::n] + tiwave]  -= amp[j::n] * torch.einsum('ijk, jl -> kil', U[iY[j::n,0]], W)
             if ctc is not None:
                 B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
-            else:
+            elif len(iY[j::n]) > 0:
                 ctc_sel = _compute_ctc_columns(U, WtW, iY[j::n, 0])
                 B[:, iX[j::n] + trange]  -= amp[j::n] * ctc_sel
                 del ctc_sel
