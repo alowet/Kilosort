@@ -165,14 +165,19 @@ def prepare_matching(ops, U):
     WtW = torch.flip(WtW, [2,])
 
     N = U.shape[0]
+    n_pcs = U.shape[1]
     ctc_bytes = N * N * (2*nt+1) * 4
     try:
         free_mem = torch.cuda.mem_get_info(U.device)[0]
     except Exception:
         free_mem = 0
 
-    # Use precomputed ctc if it fits comfortably in GPU memory
-    if ctc_bytes < free_mem * 0.4:
+    # Estimate memory needed for other tensors in run_matching:
+    #   B: N * NTbuff * 4, Xres: n_chan * NTbuff * 4 (small), plus headroom
+    NTbuff = ops['NTbuff']
+    B_bytes = N * NTbuff * 4
+    # ctc fits if it plus B plus safety margin fit in free memory
+    if ctc_bytes + B_bytes * 2 < free_mem * 0.8:
         UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
         ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
         return ctc, None
@@ -184,8 +189,20 @@ def prepare_matching(ops, U):
         return None, WtW
 
 
-def _compute_ctc_columns(U, WtW, sel_iY, chunk_size=128):
+def _compute_ctc_columns(U, WtW, sel_iY, device=None):
     """Compute ctc[:, sel_iY, :] on-the-fly in chunks to avoid O(N^2) memory."""
+    N = U.shape[0]
+    n_pcs = U.shape[1]
+    nt2 = WtW.shape[2]  # 2*nt+1
+    if device is None:
+        device = U.device
+
+    # UtU_chunk: N * chunk * n_pcs * n_pcs * 4 bytes
+    # ctc_chunk: N * chunk * nt2 * 4 bytes
+    free_mem = torch.cuda.mem_get_info(device)[0]
+    bytes_per_col = N * (n_pcs * n_pcs + nt2) * 4
+    chunk_size = max(1, int(0.15 * free_mem / bytes_per_col))
+
     ctc_chunks = []
     for c_start in range(0, len(sel_iY), chunk_size):
         c_end = min(c_start + chunk_size, len(sel_iY))
@@ -282,7 +299,7 @@ def run_matching(ops, X, U, ctc, WtW=None, device=torch.device('cuda')):
             if ctc is not None:
                 B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
             elif len(iY[j::n]) > 0:
-                ctc_sel = _compute_ctc_columns(U, WtW, iY[j::n, 0])
+                ctc_sel = _compute_ctc_columns(U, WtW, iY[j::n, 0], device=device)
                 B[:, iX[j::n] + trange]  -= amp[j::n] * ctc_sel
                 del ctc_sel
 
